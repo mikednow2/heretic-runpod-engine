@@ -1,14 +1,21 @@
-# Ubuntu 24.04 LTS natively provides Python 3.12
+# Ubuntu 24.04 LTS (Python 3.12)
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Etc/UTC
 ENV HF_HOME="/workspace/hf_cache"
 
+# Install core utilities, the SSH server, and Jupyter UI dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 python3.12-venv python3.12-dev python3-pip \
     curl nano git numactl ca-certificates \
+    openssh-server \
     && rm -rf /var/lib/apt/lists/*
+
+# Configure the SSH daemon to accept RunPod's automated key injection
+RUN mkdir /var/run/sshd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
 
 WORKDIR /workspace
 
@@ -16,10 +23,11 @@ ENV VIRTUAL_ENV=/workspace/heretic_env
 RUN python3.12 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# Install the machine learning stack alongside JupyterLab
 RUN pip install --upgrade pip && \
     pip install \
     torch "jax[cuda12]" git+https://github.com/google/torchax.git@main \
-    transformers accelerate huggingface_hub fastapi uvicorn pydantic \
+    transformers accelerate huggingface_hub fastapi uvicorn pydantic jupyterlab \
     --extra-index-url https://download.pytorch.org/whl/cu124
 
 RUN cat << 'EOF' > /workspace/main_heretic.py
@@ -47,9 +55,19 @@ except ImportError:
     from torchax.tensor import Tensor as wrap_jax
 
 from transformers import AutoTokenizer, DiffusionGemmaForBlockDiffusion
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, Security
+from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel
 import uvicorn
+
+# Security Layer: Fetches your custom token from RunPod's Environment Variables
+API_KEY = os.environ.get("API_AUTH_TOKEN", "default_failsafe_token")
+api_key_header = APIKeyHeader(name="X-API-Key")
+
+async def verify_key(api_key: str = Security(api_key_header)):
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Unauthorized Access")
+    return api_key
 
 class HereticSampler:
     def __init__(self, model, tokenizer):
@@ -69,7 +87,7 @@ class HereticSampler:
         prompt_len = prompt_ids.shape[1]
         
         if prompt_len > self.canvas_size:
-            raise ValueError(f"Prompt length ({prompt_len}) exceeds canvas size ({self.canvas_size}).")
+            raise ValueError(f"Prompt length exceeds canvas size.")
             
         canvas = torch.randint(0, self.tokenizer.vocab_size, (1, self.canvas_size))
         canvas[0, :prompt_len] = prompt_ids[0]
@@ -91,21 +109,16 @@ class HereticSampler:
             canvas = torch.where(noise_mask, random_tokens, best_tokens)
             
         generated_ids = canvas[0, prompt_len:]
-        response = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        return response
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-app = FastAPI(title="Hackable Heretic dLLM (v8 Cloud Build)")
+app = FastAPI(title="Hackable Heretic dLLM (Secure Remote)")
 MODEL_ID = "edwixx/diffusiongemma-26B-A4B-it-HERETIC-Uncensored"
 
 print("1. Loading Tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-
 print("2. Staging PyTorch weights in System RAM...")
 model = DiffusionGemmaForBlockDiffusion.from_pretrained(
-    MODEL_ID,
-    torch_dtype=torch.bfloat16,
-    device_map="cpu",
-    trust_remote_code=True
+    MODEL_ID, torch_dtype=torch.bfloat16, device_map="cpu", trust_remote_code=True
 )
 
 print("3. Executing Hybrid AI Power Bridge to JAX Mesh...")
@@ -119,7 +132,6 @@ for name, param in model.named_parameters():
     jax_sharded = jax.device_put(jax_tensor, sharding)
     param.data = wrap_jax(jax_sharded)
 
-print("4. Binding Failsafe Sampler to API...")
 sampler = HereticSampler(model, tokenizer)
 
 class ChatRequest(BaseModel):
@@ -127,7 +139,8 @@ class ChatRequest(BaseModel):
     steps: int = 20
     confidence: float = 0.85
 
-@app.post("/v1/generate")
+# The endpoint is now cryptographically locked to your authentication token
+@app.post("/v1/generate", dependencies=[Depends(verify_key)])
 async def generate(req: ChatRequest):
     return {"response": sampler.generate_canvas(req.prompt, req.steps, req.confidence)}
 
@@ -135,7 +148,22 @@ if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
 EOF
 
-EXPOSE 8000
+# Create the Multi-Service Boot Script
+RUN cat << 'EOF' > /workspace/start.sh
+#!/bin/bash
+# 1. Start the SSH Daemon for secure terminal access
+/usr/sbin/sshd
 
+# 2. Start JupyterLab (Web Interface) using your custom token for security
+jupyter-lab --allow-root --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token="$API_AUTH_TOKEN" &
+
+# 3. Start the Heretic Engine
+numactl --interleave=all python /workspace/main_heretic.py
+EOF
+
+RUN chmod +x /workspace/start.sh
+
+# Expose required ports (SSH, API, Jupyter)
+EXPOSE 22 8000 8888
 ENTRYPOINT []
-CMD ["numactl", "--interleave=all", "python", "/workspace/main_heretic.py"]
+CMD ["/workspace/start.sh"]
